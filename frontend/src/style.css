@@ -983,3 +983,28 @@ mark {
     grid-area: auto;
   }
 }
+
+/* 待提交提示条 */
+.draft-notice {
+  margin: 8px 0 14px;
+  padding: 9px 14px;
+  color: #6d4c1d;
+  background: #f6e8cd;
+  border: 1px dashed #b48f5f;
+  border-radius: 7px;
+  font-size: 13px;
+}
+
+.draft-notice a {
+  color: var(--accent);
+  font-weight: 700;
+  border-bottom: 1px solid currentColor;
+}
+
+.sheet-card__badges {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}

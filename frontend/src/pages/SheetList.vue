@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useSheetStore, type NewSheet } from '../stores/sheetStore'
+import { useWorkspaceStore } from '../stores/workspaceStore'
 import type { Sheet, SheetScale, SheetStatus } from '../types/sheet'
 import { SHEET_SCALES, SHEET_STATUSES } from '../types/sheet'
 import { useSheetNeighbors } from '../hooks/useSheetNeighbors'
@@ -9,7 +10,16 @@ import ScaleTag from '../components/common/ScaleTag.vue'
 import VacantHint from '../components/common/VacantHint.vue'
 
 const sheetStore = useSheetStore()
+const workspaceStore = useWorkspaceStore()
 const { getNeighborStatus } = useSheetNeighbors('')
+
+const pendingCountFor = (sheetId: string): number => workspaceStore.pendingCountBySheet[sheetId] ?? 0
+const conflictCountFor = (sheetId: string): number =>
+  workspaceStore.pendingConflicts.filter((conflict) => conflict.sheetId === sheetId).length
+
+onMounted(async () => {
+  await Promise.all([sheetStore.init(), workspaceStore.init()])
+})
 
 const yearFilter = ref('全部')
 const scaleFilter = ref<SheetScale | '全部'>('全部')
@@ -82,10 +92,6 @@ async function submitSheet(): Promise<void> {
   resetForm()
   showCreateForm.value = false
 }
-
-onMounted(() => {
-  void sheetStore.init()
-})
 </script>
 
 <template>
@@ -187,9 +193,17 @@ onMounted(() => {
             <div class="sheet-card__code">{{ sheet.code }}</div>
             <div class="sheet-card__series">{{ sheet.series }}</div>
           </div>
-          <el-tag :type="sheet.status === '已编' ? 'success' : sheet.status === '待核' ? 'warning' : 'info'" effect="dark">
-            {{ sheet.status }}
-          </el-tag>
+          <div class="sheet-card__badges">
+            <el-tag v-if="pendingCountFor(sheet.id)" type="warning" effect="plain" size="small">
+              {{ pendingCountFor(sheet.id) }} 步待提交
+            </el-tag>
+            <el-tag v-if="conflictCountFor(sheet.id)" type="danger" effect="plain" size="small">
+              {{ conflictCountFor(sheet.id) }} 处待核
+            </el-tag>
+            <el-tag :type="sheet.status === '已编' ? 'success' : sheet.status === '待核' ? 'warning' : 'info'" effect="dark">
+              {{ sheet.status }}
+            </el-tag>
+          </div>
         </div>
 
         <h2>{{ sheet.title }}</h2>

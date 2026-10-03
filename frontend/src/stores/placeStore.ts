@@ -1,7 +1,8 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 import type { Certainty, PlacePair, PlaceType } from '../types/placePair'
-import { createId, db, plain } from '../utils/db'
+import { createId, db } from '../utils/db'
+import { useWorkspaceStore } from './workspaceStore'
 
 export type NewPlacePair = Omit<PlacePair, 'id'>
 
@@ -37,11 +38,21 @@ export const usePlaceStore = defineStore('place', () => {
     await initialization
   }
 
+  async function reload(): Promise<void> {
+    const currentId = currentPair.value?.id
+    pairs.value = await db.placePairs.toArray()
+    if (currentId) {
+      currentPair.value = pairs.value.find((pair) => pair.id === currentId) ?? null
+    }
+  }
+
+  /** 地名对照先记入所属图幅的暂存步骤，与其它步骤一起按图幅提交。 */
   async function addPair(input: NewPlacePair): Promise<PlacePair> {
     await init()
-    const pair: PlacePair = { ...input, id: createId('place') }
-    await db.placePairs.add(plain(pair))
-    pairs.value = [...pairs.value, pair]
+    const workspace = useWorkspaceStore()
+    await workspace.init()
+    const pair: PlacePair = { ...input, id: createId('place-draft') }
+    await workspace.stagePlace(pair)
     currentPair.value = pair
     return pair
   }
@@ -51,8 +62,15 @@ export const usePlaceStore = defineStore('place', () => {
     currentPair.value = pairs.value.find((pair) => pair.id === id) ?? (await db.placePairs.get(id)) ?? null
   }
 
+  /** 含本页签暂存中的地名，供界面即时看到"待提交"步骤。 */
   function getPairsForSheet(sheetId: string): PlacePair[] {
-    return pairs.value.filter((pair) => pair.sheetId === sheetId)
+    const workspace = useWorkspaceStore()
+    const committed = pairs.value.filter((pair) => pair.sheetId === sheetId)
+    const drafts = workspace
+      .opsFor(sheetId)
+      .filter((op) => op.type === 'place.add')
+      .map((op) => op.payload as unknown as PlacePair)
+    return [...committed, ...drafts]
   }
 
   function setMatchedPairIds(ids: string[]): void {
@@ -76,6 +94,7 @@ export const usePlaceStore = defineStore('place', () => {
     filteredPairs,
     initialized,
     init,
+    reload,
     addPair,
     loadPair,
     getPairsForSheet,

@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "verify": "vite-node scripts/verify-commit.mjs && vite-node scripts/verify-upgrade.mjs"
   },
   "dependencies": {
     "dexie": "^4.0.8",
@@ -17,8 +18,10 @@
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^5.1.4",
+    "fake-indexeddb": "^6.2.5",
     "typescript": "^5.6.2",
     "vite": "^5.4.8",
+    "vite-node": "^6.0.0",
     "vue-tsc": "^2.1.6"
   }
 }

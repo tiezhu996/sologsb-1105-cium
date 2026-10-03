@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
+import { ElMessage } from 'element-plus'
 import { usePlaceStore, type NewPlacePair } from '../stores/placeStore'
 import { useSheetStore } from '../stores/sheetStore'
+import { useWorkspaceStore } from '../stores/workspaceStore'
 import type { Certainty, PlacePair, PlaceType } from '../types/placePair'
 import { CERTAINTIES, PLACE_TYPES } from '../types/placePair'
 import { usePlaceSearch } from '../hooks/usePlaceSearch'
@@ -10,6 +12,7 @@ import VacantHint from '../components/common/VacantHint.vue'
 
 const placeStore = usePlaceStore()
 const sheetStore = useSheetStore()
+const workspaceStore = useWorkspaceStore()
 const { matches } = usePlaceSearch(placeStore.keyword)
 
 const showCreateForm = ref(false)
@@ -30,12 +33,24 @@ function createEmptyForm(): NewPlacePair {
 const form = reactive<NewPlacePair>(createEmptyForm())
 const aliasInput = ref('')
 
-const visiblePairs = computed(() =>
-  placeStore.filteredPairs.filter((pair) => matches(pair)).sort((left, right) => {
-    const sheetCompare = (sheetStore.getSheetById(left.sheetId)?.year ?? 0) - (sheetStore.getSheetById(right.sheetId)?.year ?? 0)
-    return sheetCompare || left.oldName.localeCompare(right.oldName, 'zh-CN')
-  }),
+/** 主档地名 + 所有页签暂存中的地名（待提交标记） */
+const stagedPairs = computed(() =>
+  workspaceStore.workspaces
+    .flatMap((ws) => ws.ops)
+    .filter((op) => op.type === 'place.add')
+    .map((op) => ({ pair: op.payload as unknown as PlacePair, staged: true })),
 )
+
+const visiblePairs = computed(() => {
+  const committed = placeStore.filteredPairs.map((pair) => ({ pair, staged: false }))
+  const stagedIds = new Set(stagedPairs.value.map((item) => item.pair.id))
+  return [...committed.filter((item) => !stagedIds.has(item.pair.id)), ...stagedPairs.value]
+    .filter((item) => matches(item.pair))
+    .sort((left, right) => {
+      const sheetCompare = (sheetStore.getSheetById(left.pair.sheetId)?.year ?? 0) - (sheetStore.getSheetById(right.pair.sheetId)?.year ?? 0)
+      return sheetCompare || left.pair.oldName.localeCompare(right.pair.oldName, 'zh-CN')
+    })
+})
 
 function getSheetCode(pair: PlacePair): string {
   return sheetStore.getSheetById(pair.sheetId)?.code ?? '图幅待补'
@@ -64,10 +79,11 @@ async function submitPlace(): Promise<void> {
   })
   resetForm()
   showCreateForm.value = false
+  ElMessage.info('地名对照已记入所属图幅的待提交步骤')
 }
 
 async function initialize(): Promise<void> {
-  await Promise.all([sheetStore.init(), placeStore.init()])
+  await Promise.all([sheetStore.init(), placeStore.init(), workspaceStore.init()])
   if (!form.sheetId) {
     form.sheetId = sheetStore.sheets[0]?.id ?? ''
   }
@@ -145,10 +161,11 @@ onMounted(() => {
     </div>
 
     <div v-if="visiblePairs.length" class="place-list">
-      <div v-for="pair in visiblePairs" :key="pair.id" data-testid="row-place">
-        <PairRow :pair="pair" :query="placeStore.keyword" :sheet-code="getSheetCode(pair)" />
+      <div v-for="item in visiblePairs" :key="item.pair.id" data-testid="row-place">
+        <PairRow :pair="item.pair" :query="placeStore.keyword" :sheet-code="getSheetCode(item.pair)" />
         <div class="pair-row-actions">
-          <router-link :to="`/places/${pair.id}/history`">
+          <el-tag v-if="item.staged" type="warning" size="small">待提交</el-tag>
+          <router-link :to="`/places/${item.pair.id}/history`">
             <el-button link type="primary">展开沿革时间线</el-button>
           </router-link>
         </div>

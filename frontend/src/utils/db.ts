@@ -1,4 +1,5 @@
-import Dexie, { type Table } from 'dexie'
+import Dexie, { type Table, type Transaction } from 'dexie'
+import type { CommitRecord, PendingConflict, SheetBaseline, Workspace } from '../types/commit'
 import type { NameHistory } from '../types/history'
 import type { PlacePair } from '../types/placePair'
 import type { ScanItem } from '../types/scan'
@@ -381,6 +382,10 @@ class GboldmapDatabase extends Dexie {
   scans!: Table<ScanItem, string>
   placePairs!: Table<PlacePair, string>
   histories!: Table<NameHistory, string>
+  commits!: Table<CommitRecord, string>
+  baselines!: Table<SheetBaseline, string>
+  pendingConflicts!: Table<PendingConflict, string>
+  workspaces!: Table<Workspace, string>
 
   constructor() {
     super('gboldmap-db')
@@ -408,16 +413,118 @@ class GboldmapDatabase extends Dexie {
           })
       })
 
+    // version(3)：按图幅提交的操作记录、基线快照、待核与页签工作区。
+    this.version(3)
+      .stores({
+        sheets: 'id, code, year, scale, status, series',
+        scans: 'id, sheetId, importedAt, quality',
+        placePairs: 'id, sheetId, oldName, newName, placeType, certainty',
+        histories: 'id, placePairId, period, changeType',
+        commits: 'id, sheetId, seq, createdAt',
+        baselines: 'sheetId, seq',
+        pendingConflicts: 'id, sheetId, status, commitSeq, createdAt',
+        workspaces: 'id, tabId, sheetId, updatedAt',
+      })
+      .upgrade(async (transaction) => {
+        // 旧数据升级：以现有全部记录作为每个图幅 seq=0 的首个提交点。
+        const upgradeTables = await buildBaselines(transaction)
+        await transaction.table<SheetBaseline, string>('baselines').bulkAdd(upgradeTables.baselines)
+        await transaction.table<CommitRecord, string>('commits').bulkAdd(upgradeTables.commits)
+      })
+
     this.on('populate', async () => {
       await this.sheets.bulkAdd(sheets)
       await this.scans.bulkAdd(scans)
       await this.placePairs.bulkAdd(placePairs)
       await this.histories.bulkAdd(histories)
+
+      // 全新建库同样写入基线提交点，使新旧数据走同一条提交链路。
+      const seeded = buildBaselinesFromRows(sheets, scans, placePairs, histories)
+      await this.baselines.bulkAdd(seeded.baselines)
+      await this.commits.bulkAdd(seeded.commits)
     })
   }
 }
 
 export const db = new GboldmapDatabase()
+
+const BASELINE_TAB_ID = 'system-baseline'
+const BASELINE_TAB_LABEL = '旧档基线'
+const BASELINE_CREATED_AT = '2025-01-01T00:00:00.000Z'
+
+/** 升级事务内读取现有四仓并生成基线。 */
+async function buildBaselines(transaction: Transaction): Promise<{
+  baselines: SheetBaseline[]
+  commits: CommitRecord[]
+}> {
+  const [sheetRows, scanRows, pairRows, historyRows] = await Promise.all([
+    transaction.table<Sheet, string>('sheets').toCollection().toArray(),
+    transaction.table<ScanItem, string>('scans').toCollection().toArray(),
+    transaction.table<PlacePair, string>('placePairs').toCollection().toArray(),
+    transaction.table<NameHistory, string>('histories').toCollection().toArray(),
+  ])
+  return buildBaselinesFromRows(sheetRows, scanRows, pairRows, historyRows)
+}
+
+function buildBaselinesFromRows(
+  sheetRows: Sheet[],
+  scanRows: ScanItem[],
+  pairRows: PlacePair[],
+  historyRows: NameHistory[],
+): { baselines: SheetBaseline[]; commits: CommitRecord[] } {
+  const baselines: SheetBaseline[] = []
+  const commits: CommitRecord[] = []
+
+  for (const sheet of sheetRows) {
+    const placeIds = new Set(pairRows.filter((pair) => pair.sheetId === sheet.id).map((pair) => pair.id))
+    baselines.push({
+      sheetId: sheet.id,
+      seq: 0,
+      sheet: plain(sheet),
+      scans: scanRows.filter((scan) => scan.sheetId === sheet.id).map(plain),
+      placePairs: pairRows.filter((pair) => pair.sheetId === sheet.id).map(plain),
+      histories: historyRows.filter((history) => placeIds.has(history.placePairId)).map(plain),
+      capturedAt: BASELINE_CREATED_AT,
+    })
+    commits.push({
+      id: `commit-baseline-${sheet.id}`,
+      sheetId: sheet.id,
+      seq: 0,
+      baseSeq: 0,
+      ops: [],
+      tabId: BASELINE_TAB_ID,
+      tabLabel: BASELINE_TAB_LABEL,
+      message: '旧数据升级：以现有记录作为首个提交点',
+      createdAt: BASELINE_CREATED_AT,
+      conflictIndexes: [],
+    })
+  }
+
+  return { baselines, commits }
+}
+
+/**
+ * 确保每个图幅都存在基线（用于极早期数据库或异常缺失时自愈）。
+ * 在普通读写事务外调用，幂等。
+ */
+export async function ensureBaselines(): Promise<void> {
+  const [sheetRows, baselines] = await Promise.all([db.sheets.toArray(), db.baselines.toArray()])
+  const existing = new Set(baselines.map((baseline) => baseline.sheetId))
+  const missing = sheetRows.filter((sheet) => !existing.has(sheet.id))
+  if (missing.length === 0) {
+    return
+  }
+  const [scanRows, pairRows, historyRows] = await Promise.all([
+    db.scans.toArray(),
+    db.placePairs.toArray(),
+    db.histories.toArray(),
+  ])
+  const seeded = buildBaselinesFromRows(missing, scanRows, pairRows, historyRows)
+  await db.transaction('rw', db.baselines, db.commits, async () => {
+    await db.baselines.bulkAdd(seeded.baselines)
+    await db.commits.bulkAdd(seeded.commits)
+  })
+}
 
 /**
  * 剥离 Vue 响应式代理后再写入 IndexedDB。

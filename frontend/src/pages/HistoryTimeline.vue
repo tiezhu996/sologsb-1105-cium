@@ -1,9 +1,11 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
+import { ElMessage } from 'element-plus'
 import { useHistoryStore, type NewNameHistory } from '../stores/historyStore'
 import { usePlaceStore } from '../stores/placeStore'
 import { useSheetStore } from '../stores/sheetStore'
+import { useWorkspaceStore } from '../stores/workspaceStore'
 import type { NameChangeType } from '../types/history'
 import { NAME_CHANGE_TYPES } from '../types/history'
 import PairRow from '../components/common/PairRow.vue'
@@ -13,14 +15,29 @@ const route = useRoute()
 const placeStore = usePlaceStore()
 const historyStore = useHistoryStore()
 const sheetStore = useSheetStore()
+const workspaceStore = useWorkspaceStore()
 const formError = ref('')
 
 const placePairId = computed(() => String(route.params.id ?? ''))
 const pair = computed(() => {
   const current = placeStore.currentPair
-  return current?.id === placePairId.value ? current : undefined
+  if (current?.id === placePairId.value) {
+    return current
+  }
+  // 暂存中的地名对照（尚未提交）
+  return workspaceStore.workspaces
+    .flatMap((ws) => ws.ops)
+    .find((op) => op.type === 'place.add' && op.recordId === placePairId.value)
+    ?.payload as typeof current
 })
 const sheet = computed(() => (pair.value ? sheetStore.getSheetById(pair.value.sheetId) : undefined))
+const timeline = computed(() =>
+  historyStore.getForPair(placePairId.value).map((history) => ({
+    history,
+    staged: history.id.endsWith('-draft') || history.id.includes('history-draft'),
+  })),
+)
+const sheetDraftCount = computed(() => (sheet.value ? workspaceStore.pendingCountBySheet[sheet.value.id] ?? 0 : 0))
 
 function createEmptyForm(): NewNameHistory {
   return {
@@ -36,11 +53,11 @@ function createEmptyForm(): NewNameHistory {
 const form = reactive<NewNameHistory>(createEmptyForm())
 
 const narrative = computed(() => {
-  if (historyStore.currentHistories.length === 0) {
+  if (timeline.value.length === 0) {
     return '尚未录入沿革记录。'
   }
-  return historyStore.currentHistories
-    .map((history) => `${history.period}${history.name}（${history.changeType}）`)
+  return timeline.value
+    .map((item) => `${item.history.period}${item.history.name}（${item.history.changeType}）`)
     .join('；') + '。'
 })
 
@@ -66,10 +83,16 @@ async function submitHistory(): Promise<void> {
   })
   Object.assign(form, createEmptyForm())
   formError.value = ''
+  ElMessage.info('沿革已记入所属图幅的待提交步骤')
 }
 
 async function initialize(): Promise<void> {
-  await Promise.all([sheetStore.init(), placeStore.init(), historyStore.init()])
+  await Promise.all([
+    sheetStore.init(),
+    placeStore.init(),
+    historyStore.init(),
+    workspaceStore.init(),
+  ])
   await placeStore.loadPair(placePairId.value)
   await historyStore.loadFor(placePairId.value)
 }
@@ -102,25 +125,31 @@ watch(placePairId, () => {
 
         <div class="section-title">
           <h2>沿革序列</h2>
-          <span class="muted">共 {{ historyStore.currentHistories.length }} 条</span>
+          <span class="muted">共 {{ timeline.length }} 条</span>
+        </div>
+
+        <div v-if="sheetDraftCount" class="draft-notice">
+          所属图幅有 {{ sheetDraftCount }} 步待提交，含本次沿革；
+          <router-link :to="`/sheets/${sheet?.id}`">到图幅页提交</router-link>。
         </div>
 
         <div class="timeline-wrap">
           <div class="timeline-narrative">{{ narrative }}</div>
           <el-timeline>
             <el-timeline-item
-              v-for="history in historyStore.currentHistories"
-              :key="history.id"
-              :timestamp="history.period"
+              v-for="item in timeline"
+              :key="item.history.id"
+              :timestamp="item.history.period"
               placement="top"
-              :color="timelineColor(history.changeType)"
+              :color="timelineColor(item.history.changeType)"
             >
               <div class="timeline-item__head">
-                <span class="timeline-item__name">{{ history.name }}</span>
-                <el-tag effect="plain">{{ history.changeType }}</el-tag>
+                <span class="timeline-item__name">{{ item.history.name }}</span>
+                <el-tag effect="plain">{{ item.history.changeType }}</el-tag>
+                <el-tag v-if="item.staged" type="warning" size="small">待提交</el-tag>
               </div>
-              <p class="timeline-item__source">出处：{{ history.sourceRef }}</p>
-              <p class="timeline-item__note">{{ history.note || '暂无补注。' }}</p>
+              <p class="timeline-item__source">出处：{{ item.history.sourceRef }}</p>
+              <p class="timeline-item__note">{{ item.history.note || '暂无补注。' }}</p>
             </el-timeline-item>
           </el-timeline>
         </div>

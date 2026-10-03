@@ -4,6 +4,8 @@ import SheetDetail from '../pages/SheetDetail.vue'
 import PlaceBoard from '../pages/PlaceBoard.vue'
 import HistoryTimeline from '../pages/HistoryTimeline.vue'
 import NeighborView from '../pages/NeighborView.vue'
+import ReviewCenter from '../pages/ReviewCenter.vue'
+import DraftCenter from '../pages/DraftCenter.vue'
 
 const routes: RouteRecordRaw[] = [
   { path: '/', redirect: '/sheets' },
@@ -12,6 +14,8 @@ const routes: RouteRecordRaw[] = [
   { path: '/places', name: 'places', component: PlaceBoard },
   { path: '/places/:id/history', name: 'place-history', component: HistoryTimeline },
   { path: '/sheets/:id/neighbors', name: 'sheet-neighbors', component: NeighborView },
+  { path: '/review', name: 'review', component: ReviewCenter },
+  { path: '/drafts', name: 'drafts', component: DraftCenter },
   { path: '/:pathMatch(.*)*', redirect: '/sheets' },
 ]
 
