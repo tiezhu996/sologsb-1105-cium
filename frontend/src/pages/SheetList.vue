@@ -1,14 +1,18 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
+import { ElMessage } from 'element-plus'
 import { useSheetStore, type NewSheet } from '../stores/sheetStore'
+import { useCommitStore } from '../stores/commitStore'
 import type { Sheet, SheetScale, SheetStatus } from '../types/sheet'
 import { SHEET_SCALES, SHEET_STATUSES } from '../types/sheet'
 import { useSheetNeighbors } from '../hooks/useSheetNeighbors'
+import { useStagedDraft } from '../hooks/useStagedDraft'
 import { scaleToText } from '../utils/scale'
 import ScaleTag from '../components/common/ScaleTag.vue'
 import VacantHint from '../components/common/VacantHint.vue'
 
 const sheetStore = useSheetStore()
+const commitStore = useCommitStore()
 const { getNeighborStatus } = useSheetNeighbors('')
 
 const yearFilter = ref('全部')
@@ -32,6 +36,15 @@ function createEmptyForm(): NewSheet {
 }
 
 const form = reactive<NewSheet>(createEmptyForm())
+const newSheetDraft = useStagedDraft<NewSheet>({
+  draftKey: 'draft:new-sheet',
+  sheetId: '',
+  form,
+  isBlank: (draft) => !draft.code.trim() && !draft.title.trim() && !draft.projection.trim(),
+  onResumed: () => {
+    showCreateForm.value = true
+  },
+})
 
 const years = computed(() => [...new Set(sheetStore.sheets.map((sheet) => sheet.year))].sort((a, b) => b - a))
 
@@ -72,19 +85,34 @@ async function submitSheet(): Promise<void> {
     formError.value = '请填写图幅号、题名、年代与投影方式。'
     return
   }
-  await sheetStore.addSheet({
+  if (sheetStore.getSheetByCode(form.code.trim())) {
+    formError.value = '该图幅号已存在，可能已在另一个页签建档，请先核对。'
+    return
+  }
+  const { outcome, sheet } = await sheetStore.addSheet({
     ...form,
     code: form.code.trim(),
     title: form.title.trim(),
     projection: form.projection.trim(),
     series: form.series.trim() || '未分组',
   })
+  if (!outcome.ok) {
+    ElMessage.error(`建档失败，已恢复到上一提交点：${outcome.error}`)
+    return
+  }
+  if (outcome.conflicts.length) {
+    ElMessage.warning('建档内容与另一页签撞车，已进入待核台。')
+    return
+  }
+  await newSheetDraft.discard()
   resetForm()
   showCreateForm.value = false
+  ElMessage.success(`新图幅已以首个提交点建档（${sheet.code}）。`)
 }
 
-onMounted(() => {
-  void sheetStore.init()
+onMounted(async () => {
+  await commitStore.init()
+  await sheetStore.init()
 })
 </script>
 
@@ -100,6 +128,17 @@ onMounted(() => {
         新建图幅
       </el-button>
     </div>
+
+    <el-alert
+      v-if="commitStore.pendingCount"
+      :title="`有 ${commitStore.pendingCount} 条两个页签撞车的改动停在待核台，主档仍保持上一提交点。`"
+      type="warning"
+      show-icon
+      :closable="false"
+      class="mb-12"
+    >
+      <router-link to="/conflicts"><el-button size="small" type="warning" plain>前往待核台裁定</el-button></router-link>
+    </el-alert>
 
     <div class="metrics-strip">
       <div class="metric">
@@ -118,6 +157,13 @@ onMounted(() => {
 
     <form v-if="showCreateForm" class="inline-form" data-testid="form-sheet" @submit.prevent="submitSheet">
       <h2>新建图幅卡</h2>
+      <el-alert
+        v-if="newSheetDraft.resumed.value"
+        title="已恢复上次未完成的新建图幅草稿，可接着填写。"
+        type="info"
+        :closable="false"
+        class="mb-12"
+      />
       <div class="form-grid">
         <el-form-item label="图幅号" required>
           <input v-model="form.code" class="native-field" data-testid="field-code" placeholder="例如：北平-丁-1" />
@@ -225,3 +271,9 @@ onMounted(() => {
     />
   </section>
 </template>
+
+<style scoped>
+.mb-12 {
+  margin-bottom: 12px;
+}
+</style>

@@ -1,25 +1,37 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
+import { ElMessage } from 'element-plus'
 import { useSheetStore, type NewScanItem } from '../stores/sheetStore'
 import { usePlaceStore } from '../stores/placeStore'
+import { useCommitStore } from '../stores/commitStore'
+import type { Sheet } from '../types/sheet'
 import type { ColorMode, ScanQuality } from '../types/scan'
 import { COLOR_MODES, SCAN_QUALITIES } from '../types/scan'
+import { SHEET_SCALES, SHEET_STATUSES } from '../types/sheet'
 import { usePlaceSearch } from '../hooks/usePlaceSearch'
+import { useSheetCommitSync } from '../hooks/useSheetCommitSync'
+import { useStagedDraft } from '../hooks/useStagedDraft'
 import { estimateSheetSpan, scaleToText } from '../utils/scale'
 import { downloadJson } from '../utils/export'
 import PairRow from '../components/common/PairRow.vue'
 import ScanCard from '../components/common/ScanCard.vue'
 import VacantHint from '../components/common/VacantHint.vue'
+import CommitPointBar from '../components/common/CommitPointBar.vue'
+import CommitLogPanel from '../components/common/CommitLogPanel.vue'
 
 const route = useRoute()
 const sheetStore = useSheetStore()
 const placeStore = usePlaceStore()
+const commitStore = useCommitStore()
 const searchKeyword = ref('')
 const { hits } = usePlaceSearch(searchKeyword)
 const showScanForm = ref(false)
+const showEditForm = ref(false)
 
 const sheetId = computed(() => String(route.params.id ?? ''))
+useSheetCommitSync(sheetId)
+
 const sheet = computed(() => {
   const current = sheetStore.currentSheet
   return current?.id === sheetId.value ? current : undefined
@@ -44,6 +56,17 @@ function createScanForm(): NewScanItem {
 
 const scanForm = reactive<NewScanItem>(createScanForm())
 const scanFormError = ref('')
+const scanSubmitting = ref(false)
+
+const scanDraft = useStagedDraft<NewScanItem>({
+  draftKey: computed(() => `draft:scan:${sheetId.value}`),
+  sheetId,
+  form: scanForm,
+  isBlank: (form) => !form.fileName.trim() && !form.storageNote.trim(),
+  onResumed: () => {
+    showScanForm.value = true
+  },
+})
 
 function resetScanForm(): void {
   Object.assign(scanForm, createScanForm())
@@ -55,14 +78,117 @@ async function submitScan(): Promise<void> {
     scanFormError.value = '请填写扫描文件名与存放位置。'
     return
   }
-  await sheetStore.addScan({
-    ...scanForm,
-    sheetId: sheetId.value,
-    fileName: scanForm.fileName.trim(),
-    storageNote: scanForm.storageNote.trim(),
-  })
-  resetScanForm()
-  showScanForm.value = false
+  scanSubmitting.value = true
+  try {
+    const { outcome } = await sheetStore.addScan({
+      ...scanForm,
+      sheetId: sheetId.value,
+      fileName: scanForm.fileName.trim(),
+      storageNote: scanForm.storageNote.trim(),
+    })
+    if (!outcome.ok) {
+      // 写入已整体回滚，主档停在上一提交点；草稿保留，可直接重试。
+      ElMessage.error(`保存失败，已恢复到上一提交点：${outcome.error}`)
+      return
+    }
+    if (outcome.conflicts.length) {
+      ElMessage.warning('与另一页签的改动撞车，该扫描件已进入待核台，主档未改动。')
+      return
+    }
+    await scanDraft.discard()
+    resetScanForm()
+    showScanForm.value = false
+    ElMessage.success(`已作为第 ${outcome.seq} 个提交点保存，双方步骤均已保留。`)
+  } finally {
+    scanSubmitting.value = false
+  }
+}
+
+// ---- 图幅与四至修订 -------------------------------------------------------
+
+type SheetEditForm = Omit<Sheet, 'neighborCodes' | 'rowRev'> & { neighborCodesText: string }
+
+function createEditForm(source?: Sheet): SheetEditForm {
+  return {
+    id: source?.id ?? sheetId.value,
+    code: source?.code ?? '',
+    title: source?.title ?? '',
+    year: source?.year ?? 1935,
+    scale: source?.scale ?? '1:5000',
+    projection: source?.projection ?? '',
+    sheetSizeCm: source?.sheetSizeCm ?? '',
+    series: source?.series ?? '',
+    status: source?.status ?? '待编',
+    neighborCodesText: (source?.neighborCodes ?? []).join('、'),
+  }
+}
+
+const editForm = reactive<SheetEditForm>(createEditForm())
+const editFormError = ref('')
+const editSubmitting = ref(false)
+
+const editDraft = useStagedDraft<SheetEditForm>({
+  draftKey: computed(() => `draft:sheet-edit:${sheetId.value}`),
+  sheetId,
+  form: editForm,
+  isBlank: (form) => !form.title.trim() && !form.projection.trim(),
+  onResumed: () => {
+    showEditForm.value = true
+  },
+})
+
+function openEditForm(): void {
+  if (!sheet.value) {
+    return
+  }
+  Object.assign(editForm, createEditForm(sheet.value))
+  showEditForm.value = true
+}
+
+async function submitSheetEdit(): Promise<void> {
+  if (!editForm.code.trim() || !editForm.title.trim() || !editForm.projection.trim()) {
+    editFormError.value = '请填写图幅号、题名与投影方式。'
+    return
+  }
+  const baseSheet = sheetStore.getSheetById(sheetId.value)
+  if (!baseSheet) {
+    editFormError.value = '主档中找不到该图幅，请刷新后重试。'
+    return
+  }
+  editSubmitting.value = true
+  try {
+    // 始终以上一提交点的最新主档为基准携带行版本，避免拿陈旧版本覆盖。
+    const nextSheet: Sheet = {
+      id: baseSheet.id,
+      code: editForm.code.trim(),
+      title: editForm.title.trim(),
+      year: editForm.year,
+      scale: editForm.scale,
+      projection: editForm.projection.trim(),
+      sheetSizeCm: editForm.sheetSizeCm.trim(),
+      series: editForm.series.trim(),
+      neighborCodes: editForm.neighborCodesText
+        .split(/[、,，]/)
+        .map((code) => code.trim())
+        .filter(Boolean),
+      status: editForm.status,
+    }
+    const outcome = await sheetStore.updateSheet(nextSheet)
+    if (!outcome.ok) {
+      ElMessage.error(`保存失败，已恢复到上一提交点：${outcome.error}`)
+      return
+    }
+    if (outcome.conflicts.length) {
+      ElMessage.warning('另一页签也修订了同一图幅卡，你的改动已进入待核台裁定。')
+      return
+    }
+    await editDraft.discard()
+    showEditForm.value = false
+    editFormError.value = ''
+    ElMessage.success(`图幅修订已提交（提交点 ${outcome.seq}）。`)
+  } finally {
+    editSubmitting.value = false
+  }
 }
 
 function exportSheet(): void {
@@ -77,7 +203,7 @@ function exportSheet(): void {
 }
 
 async function initialize(): Promise<void> {
-  await Promise.all([sheetStore.init(), placeStore.init()])
+  await Promise.all([sheetStore.init(), placeStore.init(), commitStore.init()])
   await sheetStore.loadSheet(sheetId.value)
 }
 
@@ -93,6 +219,16 @@ watch(sheetId, () => {
 
 <template>
   <section v-if="sheet" class="page" data-testid="detail-sheet">
+    <CommitPointBar :sheet-id="sheet.id" />
+    <el-alert
+      v-if="commitStore.syncMessage"
+      :title="commitStore.syncMessage"
+      type="success"
+      :closable="true"
+      class="mb-12"
+      @close="commitStore.syncMessage = ''"
+    />
+
     <div class="detail-layout">
       <div>
         <header class="detail-hero">
@@ -109,16 +245,71 @@ watch(sheetId, () => {
           </div>
         </header>
 
+        <form v-if="showEditForm" class="inline-form" data-testid="form-sheet-edit" @submit.prevent="submitSheetEdit">
+          <h2>修订图幅与四至</h2>
+          <p class="muted">改动以整幅图卡提交；与另一页签同改一卡时进入待核，不会互相覆盖。</p>
+          <div class="form-grid">
+            <el-form-item label="图幅号" required>
+              <input v-model="editForm.code" class="native-field" />
+            </el-form-item>
+            <el-form-item label="图幅题名" required>
+              <input v-model="editForm.title" class="native-field" />
+            </el-form-item>
+            <el-form-item label="测绘年代" required>
+              <input v-model.number="editForm.year" class="native-field" type="number" min="1800" max="2100" />
+            </el-form-item>
+            <el-form-item label="比例尺" required>
+              <select v-model="editForm.scale" class="native-field">
+                <option v-for="scale in SHEET_SCALES" :key="scale" :value="scale">{{ scale }}</option>
+              </select>
+            </el-form-item>
+            <el-form-item label="投影方式" required>
+              <input v-model="editForm.projection" class="native-field" />
+            </el-form-item>
+            <el-form-item label="所属图组">
+              <input v-model="editForm.series" class="native-field" />
+            </el-form-item>
+            <el-form-item label="整理状态">
+              <select v-model="editForm.status" class="native-field">
+                <option v-for="status in SHEET_STATUSES" :key="status" :value="status">{{ status }}</option>
+              </select>
+            </el-form-item>
+            <el-form-item label="图幅尺寸">
+              <input v-model="editForm.sheetSizeCm" class="native-field" />
+            </el-form-item>
+            <el-form-item label="四至邻接图号" class="form-grid__wide">
+              <input v-model="editForm.neighborCodesText" class="native-field" placeholder="多个图号用中文顿号分隔" />
+            </el-form-item>
+            <div class="form-actions">
+              <el-button @click="showEditForm = false">取消</el-button>
+              <el-button type="primary" native-type="submit" :loading="editSubmitting" data-testid="submit-sheet-edit">
+                提交图幅修订
+              </el-button>
+            </div>
+          </div>
+          <p v-if="editFormError" class="text-danger">{{ editFormError }}</p>
+        </form>
+
         <div class="section-title">
           <div>
             <h2>扫描件条目</h2>
             <span class="muted">主用件优先作为地名核录与拼合基准</span>
           </div>
-          <el-button type="primary" plain @click="showScanForm = true">登记扫描件</el-button>
+          <div class="section-title__actions">
+            <el-button plain @click="openEditForm" data-testid="open-sheet-edit">修改图幅与四至</el-button>
+            <el-button type="primary" plain @click="showScanForm = true">登记扫描件</el-button>
+          </div>
         </div>
 
         <form v-if="showScanForm" class="inline-form" @submit.prevent="submitScan">
           <h2>登记扫描件</h2>
+          <el-alert
+            v-if="scanDraft.resumed.value"
+            title="已恢复上次未提交的扫描件草稿，可接着补录后再提交。"
+            type="info"
+            :closable="false"
+            class="mb-12"
+          />
           <div class="form-grid">
             <el-form-item label="扫描文件名" required>
               <input v-model="scanForm.fileName" class="native-field" />
@@ -147,7 +338,7 @@ watch(sheetId, () => {
             </el-form-item>
             <div class="form-actions">
               <el-button @click="showScanForm = false; resetScanForm()">取消</el-button>
-              <el-button type="primary" native-type="submit">保存扫描件</el-button>
+              <el-button type="primary" native-type="submit" :loading="scanSubmitting">保存扫描件</el-button>
             </div>
           </div>
           <p v-if="scanFormError" class="text-danger">{{ scanFormError }}</p>
@@ -158,7 +349,7 @@ watch(sheetId, () => {
           <div v-if="sheetStore.currentScans.length === 0" class="empty-inline">该图幅尚未登记扫描件。</div>
         </div>
         <div v-if="sheetStore.currentScans.length" class="section-title">
-          <span class="muted">主用件标记可随时切换，原主用件会自动取消。</span>
+          <span class="muted">主用件标记以同组操作提交，切换不会只改一半。</span>
           <div>
             <el-button
               v-for="scan in sheetStore.currentScans"
@@ -215,6 +406,8 @@ watch(sheetId, () => {
       />
       <div v-if="searchKeyword && relatedHits.length === 0" class="empty-inline">本地名未检索到吻合记录。</div>
     </div>
+
+    <CommitLogPanel class="mt-20" :sheet-id="sheet.id" />
   </section>
 
   <section v-else class="page">
@@ -222,3 +415,18 @@ watch(sheetId, () => {
     <VacantHint title="未找到该图幅" description="图幅可能已被移除，请返回编目台重新选择。" />
   </section>
 </template>
+
+<style scoped>
+.section-title__actions {
+  display: flex;
+  gap: 8px;
+}
+
+.form-grid__wide {
+  grid-column: 1 / -1;
+}
+
+.mb-12 {
+  margin-bottom: 12px;
+}
+</style>

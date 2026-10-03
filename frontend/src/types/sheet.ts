@@ -12,6 +12,8 @@ export interface Sheet {
   series: string
   neighborCodes: string[]
   status: SheetStatus
+  /** 主档行版本：每次对该图幅的干净重放 +1，用于两个页签之间的提交冲突判定。 */
+  rowRev?: number
 }
 
 export const SHEET_SCALES: SheetScale[] = ['1:5000', '1:50000']

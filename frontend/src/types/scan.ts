@@ -12,6 +12,8 @@ export interface ScanItem {
   storageNote: string
   importedAt: string
   isPrimary: boolean
+  /** 主档行版本，随成功重放自增，作为提交时的乐观锁。 */
+  rowRev?: number
 }
 
 export const COLOR_MODES: ColorMode[] = ['彩色', '黑白', '灰度']

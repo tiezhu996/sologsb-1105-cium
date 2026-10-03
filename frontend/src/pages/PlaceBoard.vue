@@ -1,15 +1,19 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { ElMessage } from 'element-plus'
 import { usePlaceStore, type NewPlacePair } from '../stores/placeStore'
 import { useSheetStore } from '../stores/sheetStore'
-import type { Certainty, PlacePair, PlaceType } from '../types/placePair'
+import { useCommitStore } from '../stores/commitStore'
+import type { PlacePair } from '../types/placePair'
 import { CERTAINTIES, PLACE_TYPES } from '../types/placePair'
 import { usePlaceSearch } from '../hooks/usePlaceSearch'
+import { useStagedDraft } from '../hooks/useStagedDraft'
 import PairRow from '../components/common/PairRow.vue'
 import VacantHint from '../components/common/VacantHint.vue'
 
 const placeStore = usePlaceStore()
 const sheetStore = useSheetStore()
+const commitStore = useCommitStore()
 const { matches } = usePlaceSearch(placeStore.keyword)
 
 const showCreateForm = ref(false)
@@ -29,6 +33,34 @@ function createEmptyForm(): NewPlacePair {
 
 const form = reactive<NewPlacePair>(createEmptyForm())
 const aliasInput = ref('')
+
+// 草稿同时带上独立的异写输入框文本，恢复时不丢。
+const draftState = reactive<NewPlacePair & { aliasText: string }>({
+  ...form,
+  aliasText: '',
+})
+watch(
+  form,
+  () => {
+    Object.assign(draftState, { ...form })
+  },
+  { deep: true },
+)
+watch(aliasInput, (value) => {
+  draftState.aliasText = value
+})
+
+const placeDraft = useStagedDraft<NewPlacePair & { aliasText: string }>({
+  draftKey: computed(() => `draft:new-place:${form.sheetId || 'none'}`),
+  sheetId: computed(() => form.sheetId),
+  form: draftState,
+  isBlank: (draft) => !draft.oldName.trim() && !draft.newName.trim(),
+  onResumed: (payload) => {
+    Object.assign(form, payload)
+    aliasInput.value = payload.aliasText ?? ''
+    showCreateForm.value = true
+  },
+})
 
 const visiblePairs = computed(() =>
   placeStore.filteredPairs.filter((pair) => matches(pair)).sort((left, right) => {
@@ -52,7 +84,7 @@ async function submitPlace(): Promise<void> {
     formError.value = '请选择所属图幅，并填写古名与今名。'
     return
   }
-  await placeStore.addPair({
+  const { outcome } = await placeStore.addPair({
     ...form,
     oldName: form.oldName.trim(),
     newName: form.newName.trim(),
@@ -62,12 +94,23 @@ async function submitPlace(): Promise<void> {
       .map((alias) => alias.trim())
       .filter(Boolean),
   })
+  if (!outcome.ok) {
+    ElMessage.error(`保存失败，已恢复到上一提交点：${outcome.error}`)
+    return
+  }
+  if (outcome.conflicts.length) {
+    ElMessage.warning('该地名对照与另一页签改动撞车，已进入待核台。')
+    return
+  }
+  await placeDraft.discard()
+  aliasInput.value = ''
   resetForm()
   showCreateForm.value = false
+  ElMessage.success(`地名对照已随图幅提交（提交点 ${outcome.seq}）。`)
 }
 
 async function initialize(): Promise<void> {
-  await Promise.all([sheetStore.init(), placeStore.init()])
+  await Promise.all([sheetStore.init(), placeStore.init(), commitStore.init()])
   if (!form.sheetId) {
     form.sheetId = sheetStore.sheets[0]?.id ?? ''
   }
@@ -93,6 +136,13 @@ onMounted(() => {
 
     <form v-if="showCreateForm" class="inline-form" data-testid="form-place" @submit.prevent="submitPlace">
       <h2>新建古今地名对照</h2>
+      <el-alert
+        v-if="placeDraft.resumed.value"
+        title="已恢复上次未提交的地名对照草稿，可接着补录。"
+        type="info"
+        :closable="false"
+        class="mb-12"
+      />
       <div class="form-grid">
         <el-form-item label="所属图幅" required>
           <select v-model="form.sheetId" class="native-field" data-testid="field-sheetId">
@@ -174,6 +224,10 @@ onMounted(() => {
   display: flex;
   justify-content: flex-end;
   padding: 5px 12px 0;
+}
+
+.mb-12 {
+  margin-bottom: 12px;
 }
 
 @media (max-width: 680px) {

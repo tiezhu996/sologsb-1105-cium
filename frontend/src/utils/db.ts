@@ -1,4 +1,5 @@
 import Dexie, { type Table } from 'dexie'
+import type { CommitOp, CommitRecord, ConflictRecord, DraftRecord } from '../types/commit'
 import type { NameHistory } from '../types/history'
 import type { PlacePair } from '../types/placePair'
 import type { ScanItem } from '../types/scan'
@@ -368,7 +369,7 @@ const histories: NameHistory[] = [
   { id: 'hist-16', placePairId: 'place-tj-dong-2-2', period: '1952 年', name: '建国道一带', changeType: '废置', sourceRef: '天津市街巷名录', note: '旧聚落名称不再作为正式地名，转作历史区域。' },
   { id: 'hist-17', placePairId: 'place-bd-zhong-4-1', period: '宋淳化三年（992）', name: '保塞县署', changeType: '初置', sourceRef: '《宋史·地理志》', note: '县治设于今保定旧城，后屡有移改。' },
   { id: 'hist-18', placePairId: 'place-bd-zhong-4-1', period: '金正大四年（1227）', name: '清苑县署', changeType: '改名', sourceRef: '《金史·地理志》', note: '保州升顺天军，附郭县名沿用清苑。' },
-    { id: 'hist-19', placePairId: 'place-bd-zhong-4-2', period: '元太宗十年（1238）', name: '大慈阁', changeType: '初置', sourceRef: '《保定府志》卷十四', note: '真觉禅寺建成，阁前街巷逐渐成市。' },
+  { id: 'hist-19', placePairId: 'place-bd-zhong-4-2', period: '元太宗十年（1238）', name: '大慈阁', changeType: '初置', sourceRef: '《保定府志》卷十四', note: '真觉禅寺建成，阁前街巷逐渐成市。' },
   { id: 'hist-20', placePairId: 'place-bd-zhong-4-2', period: '2001 年', name: '大慈阁社区', changeType: '改名', sourceRef: '保定市地名志', note: '以古建名称命名社区，旧街名保留为支巷名。' },
   { id: 'hist-21', placePairId: 'place-kf-chengxi-1-1', period: '唐建中二年（781）', name: '汴州西门', changeType: '初置', sourceRef: '《旧唐书·宣武军》', note: '汴州城扩建后设置西城门。' },
   { id: 'hist-22', placePairId: 'place-kf-chengxi-1-1', period: '明洪武元年（1368）', name: '大梁门', changeType: '改名', sourceRef: '《开封府志》卷三', note: '城门重修筑楼，取大梁旧国名称。' },
@@ -376,11 +377,73 @@ const histories: NameHistory[] = [
   { id: 'hist-24', placePairId: 'place-kf-chengxi-1-2', period: '北宋天圣年间', name: '州桥', changeType: '改名', sourceRef: '《东京梦华录》卷二', note: '御街跨桥通称州桥，天汉桥为正式桥名。' },
 ]
 
+/** 建账（旧数据升级或首次播种）使用的固定页签与时间戳。 */
+export const BOOTSTRAP_TAB_ID = 'bootstrap'
+const BOOTSTRAP_AT = '2025-01-01T00:00:00.000Z'
+
+/** 旧数据升级为首个提交点时，把主档行版本统一落在 1。 */
+export const BASELINE_ROW_REV = 1
+
+type StampedSheet = Sheet & { rowRev: number }
+type StampedScan = ScanItem & { rowRev: number }
+type StampedPair = PlacePair & { rowRev: number }
+type StampedHistory = NameHistory & { rowRev: number }
+
+/**
+ * 把现有主档记录重放为某图幅的首个提交（建账提交）。
+ * 升级与首次播种共用，保证“现有记录即第一个提交点”。
+ */
+export function buildBaselineCommit(
+  sheet: StampedSheet,
+  sheetScans: StampedScan[],
+  sheetPairs: StampedPair[],
+  sheetHistories: StampedHistory[],
+): CommitRecord {
+  const ops: CommitOp[] = [
+    { kind: 'sheetUpsert', clientId: `bootstrap-${sheet.id}`, baseRowRev: 0, entity: sheet },
+    ...sheetScans.map((scan) => ({
+      kind: 'scanUpsert' as const,
+      clientId: `bootstrap-${scan.id}`,
+      baseRowRev: 0,
+      entity: scan,
+    })),
+    ...sheetPairs.map((pair) => ({
+      kind: 'pairUpsert' as const,
+      clientId: `bootstrap-${pair.id}`,
+      baseRowRev: 0,
+      entity: pair,
+    })),
+    ...sheetHistories.map((history) => ({
+      kind: 'historyUpsert' as const,
+      clientId: `bootstrap-${history.id}`,
+      baseRowRev: 0,
+      entity: history,
+    })),
+  ]
+  return {
+    id: `commit-bootstrap-${sheet.id}`,
+    sheetId: sheet.id,
+    seq: 1,
+    rev: 1,
+    kind: 'bootstrap',
+    label: `旧数据建账提交（${sheet.code}）`,
+    note: '升级前已有记录重放为首个提交点，主档行版本自 1 起算。',
+    ops,
+    appliedOpCount: ops.length,
+    tabId: BOOTSTRAP_TAB_ID,
+    clientBaseRev: 0,
+    createdAt: BOOTSTRAP_AT,
+  }
+}
+
 class GboldmapDatabase extends Dexie {
   sheets!: Table<Sheet, string>
   scans!: Table<ScanItem, string>
   placePairs!: Table<PlacePair, string>
   histories!: Table<NameHistory, string>
+  commits!: Table<CommitRecord, string>
+  conflicts!: Table<ConflictRecord, string>
+  drafts!: Table<DraftRecord, string>
 
   constructor() {
     super('gboldmap-db')
@@ -408,11 +471,111 @@ class GboldmapDatabase extends Dexie {
           })
       })
 
+    // v3：提交记录（按图幅成链）、待核台、草稿台三个新仓库；
+    // 旧主档数据在同一升级事务内重放为每图幅首个提交点。
+    this.version(3)
+      .stores({
+        sheets: 'id, code, year, scale, status, series',
+        scans: 'id, sheetId, importedAt, quality',
+        placePairs: 'id, sheetId, oldName, newName, placeType, certainty',
+        histories: 'id, placePairId, period, changeType',
+        commits: 'id, sheetId, [sheetId+seq], rev, kind, createdAt',
+        conflicts: 'id, sheetId, status, createdAt, commitId',
+        drafts: 'key, sheetId, updatedAt',
+      })
+      .upgrade(async (transaction) => {
+        const tSheets = transaction.table<Sheet & { schemaRev?: number }, string>('sheets')
+        const tScans = transaction.table<ScanItem, string>('scans')
+        const tPairs = transaction.table<PlacePair, string>('placePairs')
+        const tHistories = transaction.table<NameHistory, string>('histories')
+        const tCommits = transaction.table<CommitRecord, string>('commits')
+
+        const [oldSheets, oldScans, oldPairs, oldHistories] = await Promise.all([
+          tSheets.toCollection().toArray(),
+          tScans.toCollection().toArray(),
+          tPairs.toCollection().toArray(),
+          tHistories.toCollection().toArray(),
+        ])
+
+        const stampedSheets: StampedSheet[] = oldSheets.map((sheet) => ({
+          ...sheet,
+          schemaRev: 3,
+          rowRev: BASELINE_ROW_REV,
+        }))
+        const stampedScans: StampedScan[] = oldScans.map((scan) => ({
+          ...scan,
+          rowRev: BASELINE_ROW_REV,
+        }))
+        const stampedPairs: StampedPair[] = oldPairs.map((pair) => ({
+          ...pair,
+          rowRev: BASELINE_ROW_REV,
+        }))
+        const stampedHistories: StampedHistory[] = oldHistories.map((history) => ({
+          ...history,
+          rowRev: BASELINE_ROW_REV,
+        }))
+
+        await tSheets.bulkPut(stampedSheets)
+        await Promise.all([
+          tScans.bulkPut(stampedScans),
+          tPairs.bulkPut(stampedPairs),
+          tHistories.bulkPut(stampedHistories),
+        ])
+
+        const orderedSheets = [...stampedSheets].sort((left, right) =>
+          left.code.localeCompare(right.code, 'zh-CN'),
+        )
+        const baselines = orderedSheets.map((sheet) =>
+          buildBaselineCommit(
+            sheet,
+            stampedScans.filter((scan) => scan.sheetId === sheet.id),
+            stampedPairs.filter((pair) => pair.sheetId === sheet.id),
+            stampedHistories.filter((history) =>
+              stampedPairs.some(
+                (pair) => pair.sheetId === sheet.id && pair.id === history.placePairId,
+              ),
+            ),
+          ),
+        )
+        await tCommits.bulkAdd(baselines)
+      })
+
     this.on('populate', async () => {
-      await this.sheets.bulkAdd(sheets)
-      await this.scans.bulkAdd(scans)
-      await this.placePairs.bulkAdd(placePairs)
-      await this.histories.bulkAdd(histories)
+      const seededSheets: StampedSheet[] = sheets.map((sheet) => ({
+        ...sheet,
+        rowRev: BASELINE_ROW_REV,
+      }))
+      const seededScans: StampedScan[] = scans.map((scan) => ({
+        ...scan,
+        rowRev: BASELINE_ROW_REV,
+      }))
+      const seededPairs: StampedPair[] = placePairs.map((pair) => ({
+        ...pair,
+        rowRev: BASELINE_ROW_REV,
+      }))
+      const seededHistories: StampedHistory[] = histories.map((history) => ({
+        ...history,
+        rowRev: BASELINE_ROW_REV,
+      }))
+
+      await this.sheets.bulkAdd(seededSheets)
+      await this.scans.bulkAdd(seededScans)
+      await this.placePairs.bulkAdd(seededPairs)
+      await this.histories.bulkAdd(seededHistories)
+
+      const baselines = seededSheets.map((sheet) =>
+        buildBaselineCommit(
+          sheet,
+          seededScans.filter((scan) => scan.sheetId === sheet.id),
+          seededPairs.filter((pair) => pair.sheetId === sheet.id),
+          seededHistories.filter((history) =>
+            seededPairs.some(
+              (pair) => pair.sheetId === sheet.id && pair.id === history.placePairId,
+            ),
+          ),
+        ),
+      )
+      await this.commits.bulkAdd(baselines)
     })
   }
 }

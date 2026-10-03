@@ -1,18 +1,23 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
+import { ElMessage } from 'element-plus'
 import { useHistoryStore, type NewNameHistory } from '../stores/historyStore'
 import { usePlaceStore } from '../stores/placeStore'
 import { useSheetStore } from '../stores/sheetStore'
+import { useCommitStore } from '../stores/commitStore'
 import type { NameChangeType } from '../types/history'
 import { NAME_CHANGE_TYPES } from '../types/history'
+import { useStagedDraft } from '../hooks/useStagedDraft'
 import PairRow from '../components/common/PairRow.vue'
+import CommitPointBar from '../components/common/CommitPointBar.vue'
 import VacantHint from '../components/common/VacantHint.vue'
 
 const route = useRoute()
 const placeStore = usePlaceStore()
 const historyStore = useHistoryStore()
 const sheetStore = useSheetStore()
+const commitStore = useCommitStore()
 const formError = ref('')
 
 const placePairId = computed(() => String(route.params.id ?? ''))
@@ -35,6 +40,13 @@ function createEmptyForm(): NewNameHistory {
 
 const form = reactive<NewNameHistory>(createEmptyForm())
 
+const historyDraft = useStagedDraft<NewNameHistory>({
+  draftKey: computed(() => `draft:new-history:${placePairId.value}`),
+  sheetId: computed(() => pair.value?.sheetId ?? ''),
+  form,
+  isBlank: (draft) => !draft.period.trim() && !draft.name.trim() && !draft.sourceRef.trim(),
+})
+
 const narrative = computed(() => {
   if (historyStore.currentHistories.length === 0) {
     return '尚未录入沿革记录。'
@@ -56,7 +68,7 @@ async function submitHistory(): Promise<void> {
     formError.value = '请填写年代、地名与出处置信。'
     return
   }
-  await historyStore.addHistory({
+  const { outcome } = await historyStore.addHistory({
     ...form,
     placePairId: placePairId.value,
     period: form.period.trim(),
@@ -64,12 +76,27 @@ async function submitHistory(): Promise<void> {
     sourceRef: form.sourceRef.trim(),
     note: form.note.trim(),
   })
+  if (!outcome.ok) {
+    ElMessage.error(`保存失败，已恢复到上一提交点：${outcome.error}`)
+    return
+  }
+  if (outcome.conflicts.length) {
+    ElMessage.warning('该沿革随上游改动一并进入待核台，主档未改动。')
+    return
+  }
+  await historyDraft.discard()
   Object.assign(form, createEmptyForm())
   formError.value = ''
+  ElMessage.success(`沿革已随图幅提交（提交点 ${outcome.seq}）。`)
 }
 
 async function initialize(): Promise<void> {
-  await Promise.all([sheetStore.init(), placeStore.init(), historyStore.init()])
+  await Promise.all([
+    sheetStore.init(),
+    placeStore.init(),
+    historyStore.init(),
+    commitStore.init(),
+  ])
   await placeStore.loadPair(placePairId.value)
   await historyStore.loadFor(placePairId.value)
 }
@@ -87,6 +114,7 @@ watch(placePairId, () => {
 
 <template>
   <section v-if="pair" class="page">
+    <CommitPointBar :sheet-id="pair.sheetId" />
     <div class="page-heading">
       <div>
         <span class="page-kicker">NAME EVOLUTION</span>
@@ -129,6 +157,13 @@ watch(placePairId, () => {
       <aside>
         <form class="inline-form" @submit.prevent="submitHistory">
           <h2>新增沿革记录</h2>
+          <el-alert
+            v-if="historyDraft.resumed.value"
+            title="已恢复上次未提交的沿革草稿，可接着补录。"
+            type="info"
+            :closable="false"
+            class="mb-12"
+          />
           <el-form-item label="年代或朝代" required>
             <input v-model="form.period" class="native-field" data-testid="field-period" placeholder="例如：清光绪三十四年（1908）" />
           </el-form-item>

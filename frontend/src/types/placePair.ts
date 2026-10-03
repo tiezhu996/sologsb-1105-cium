@@ -10,6 +10,8 @@ export interface PlacePair {
   placeType: PlaceType
   coordNote: string
   certainty: Certainty
+  /** 主档行版本，随成功重放自增，作为提交时的乐观锁。 */
+  rowRev?: number
 }
 
 export const PLACE_TYPES: PlaceType[] = ['山川', '村镇', '衙署', '桥梁']
